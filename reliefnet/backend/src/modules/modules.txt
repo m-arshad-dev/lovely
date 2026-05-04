@@ -1,0 +1,798 @@
+
+===== ./users/user.routes.js =====
+const express = require("express");
+const router = express.Router();
+
+const userController = require("./user.controller");
+
+// Create user
+router.post("/", userController.createUser);
+
+// Get user by id
+router.get("/:id", userController.getUser);
+
+// Assign role to user
+router.post("/assign-role", userController.assignRole);
+
+module.exports = router;
+===== ./users/user.service.js =====
+const {withTransaction} = require('../../config/transaction');
+
+const userRepo = require('./user.repository');
+const roleRepo = require('../roles/role.repository');
+const userRoleRepo = require('../user_roles/userRole.repository');
+
+
+async function createUser(data){
+    return withTransaction(async client => {
+        try {
+            return await userRepo.createUser(
+                client,
+                data.name,
+                data.email,
+                data.password
+            );
+        } catch (err) {
+            if (err.code === '23505') {
+                throw new Error("User already exists");
+            }
+            throw err;
+        }
+    });
+}
+async function assignRoleToUser(userId, roleId) {
+    return withTransaction(async client => {
+
+        const user = await userRepo.getUserById(client, userId);
+        if (!user) throw new Error("User not found");
+
+        const role = await roleRepo.getRoleById(client, roleId);
+        if (!role) throw new Error("Role not found");
+
+        return await userRoleRepo.assignRole(client, userId, roleId);
+    });
+}
+async function getUserProfile(userId) {
+return withTransaction(async client =>{
+        const user =await userRepo.getUserById( client , userId);
+
+        if (!user) throw new Error('User not found');
+
+        const roles =await userRoleRepo.getUserRoles(client,  userId);
+
+        return {
+            ...user,
+            roles
+        }
+})
+}
+
+module.exports = {
+    getUserProfile ,
+    createUser,
+    assignRoleToUser
+}
+===== ./users/user.controller.js =====
+const service = require("./user.service");
+const asyncHandler = require('../../utils/asyncHandler')
+
+
+const createUser = asyncHandler(async(req ,res)=>{
+    const user = await service.createUser(req.body);
+    res.status(201).json(user);
+})
+
+const assignRole = asyncHandler(async(req, res) =>{
+
+    const userId = Number(req.body.userId);
+    const roleId = Number(req.body.roleId);
+
+    if (isNaN(userId) || isNaN(roleId)) {
+    throw new Error("Invalid userId or roleId");
+    }
+    const result = await service.assignRoleToUser(
+        userId,
+        roleId
+    );
+    res.status(201).json(result);
+})
+
+const  getUser = asyncHandler(async(req, res) =>{
+    const result = await service.getUserProfile(req.params.id);
+    res.json(result);
+});
+
+module.exports = {
+    createUser,
+    assignRole,
+    getUser
+};
+===== ./users/user.repository.js =====
+
+
+async function createUser(client ,name , email , passwordHash){
+    const query = `INSERT INTO users (name , email , password_hash)
+            VALUES ($1 , $2 , $3)
+            RETURNING *`;
+    const res =await client.query(query , [name, email , passwordHash])
+
+    return res.rows[0];
+
+}
+
+async function getUserById(client , id){
+    const query = `SELECT * FROM users 
+            WHERE id= $1`
+    const res = await client.query(query , [id]);
+
+    return res.rows[0]
+}
+// READ (global)
+async function getUserByIdGlobal(id) {
+    const res = await db.query(
+        `SELECT * FROM users WHERE id = $1`,
+        [id]
+    );
+
+    return res.rows[0];
+}
+async function getUserByEmail(client , email){
+    const res = await client.query(`
+        SELECT * FROM users WHERE email=$1
+        ` ,[email])
+    return res.rows[0];
+}
+
+
+module.exports = {
+    createUser,
+    getUserById,
+    getUserByIdGlobal,
+    getUserByEmail
+}
+===== ./roles/role.routes.js =====
+const express = require("express");
+const router = express.Router();
+
+const roleController = require("./role.controller");
+
+// GET all roles
+router.get("/", roleController.getRoles);
+
+// GET role by id
+router.get("/:id", roleController.getRole);
+
+module.exports = router;
+===== ./roles/role.repository.js =====
+const db = require('../../config/db')
+
+async function getRoleById(client, id) {
+    const query = `SELECT * FROM roles WHERE id=$1`;
+    const res = await db.query(query, [id]);
+    return res.rows[0];
+}
+
+async function getAllRoles(client) {
+    const query = `SELECT * FROM roles`;
+    const res = await db.query(query);
+    return res.rows;
+}
+
+module.exports = {
+    getAllRoles,
+    getRoleById
+};
+===== ./roles/role.controller.js =====
+const roleService = require("./role.service");
+const asyncHandler = require('../../utils/asyncHandler')
+
+const getRoles = asyncHandler(async (req ,res)=>{
+    const roles = await roleService.getAllRoles();
+    res.json(roles);
+})
+
+
+const getRole = asyncHandler(async  (req, res)=> {
+    const role = await roleService.getRoleById(req.params.id);
+    res.json(role);
+});
+
+module.exports = {
+  getRoles,
+  getRole
+};
+===== ./roles/role.service.js =====
+const { withTransaction } = require('../../config/transaction');
+const roleRepo = require('./role.repository');
+
+async function getAllRoles() {
+return withTransaction(async (client) =>{
+            const roles = await roleRepo.getAllRoles(client);
+
+        if (roles.length === 0) {
+            throw new Error("No roles exist in the system");
+        }
+        return roles;
+})
+
+}
+
+async function getRoleById(id) {
+return withTransaction(async (client) => {
+            const role = await roleRepo.getRoleById(id);
+
+        if (!role) {
+            throw new Error("Role not found");
+        }
+
+        return role;
+})
+}
+
+module.exports = {
+    getAllRoles,
+    getRoleById
+};
+===== ./user_roles/userRole.repository.js =====
+async function assignRole(client, userId, roleId) {
+
+    // check if already exists
+    const check = await client.query(
+        `SELECT 1 FROM user_roles
+         WHERE user_id = $1 AND role_id = $2`,
+        [userId, roleId]
+    );
+
+    if (check.rows.length > 0) {
+        return { message: "Role already assigned" };
+    }
+
+    const query = `
+        INSERT INTO user_roles (user_id, role_id)
+        VALUES ($1, $2)
+        RETURNING *;
+    `;
+
+    const res = await client.query(query, [userId, roleId]);
+
+    return res.rows[0];
+}
+
+async function getUserRoles(client ,userId){
+    const query = `SELECT r.*
+                    FROM roles r
+                    JOIN user_roles ur ON r.id = ur.role_id
+                    WHERE ur.user_id = $1`
+    const res = await client.query(query , [userId]);
+
+    return res.rows;
+}
+
+module.exports = {
+    getUserRoles,
+    assignRole
+}
+===== ./onboarding/onboarding_execution.routes.js =====
+const express = require("express");
+const router = express.Router();
+
+const controller = require("./onboarding_execution.controller");
+
+// submit step
+router.post("/submit", controller.submitStep);
+
+module.exports = router;
+===== ./onboarding/onboarding_flow.controller.js =====
+const service = require("./onboarding_flow.service");
+const asyncHandler = require("../../utils/asyncHandler");
+
+const startFlow = asyncHandler(async (req, res) => {
+    const { userRoleId, templateId } = req.body;
+
+    const result = await service.startFlow(userRoleId, templateId);
+
+    res.status(201).json(result);
+});
+
+const getFlow = asyncHandler(async (req, res) => {
+    const result = await service.getFlow(req.params.id);
+    res.json(result);
+});
+
+module.exports = {
+    startFlow,
+    getFlow
+};
+===== ./onboarding/onboarding_flow.repository.js =====
+const db = require("../../config/db");
+
+// CREATE FLOW
+async function createFlow(client, userRoleId, templateId) {
+    const res = await client.query(
+        `INSERT INTO onboarding_flows (user_role_id, template_id, status)
+        VALUES ($1, $2, 'IN_PROGRESS')
+         RETURNING *`,
+        [userRoleId, templateId]
+    );
+
+    return res.rows[0];
+}
+
+// GET FLOW
+async function getFlow(flowId) {
+    const res = await db.query(
+        `SELECT * FROM onboarding_flows WHERE id = $1`,
+        [flowId]
+    );
+
+    return res.rows[0];
+}
+
+// UPDATE CURRENT STEP
+async function updateCurrentStep(client, flowId, stepId) {
+const res = await client.query(
+    `UPDATE onboarding_flows
+        SET current_step_id = $2,
+            updated_at = now()
+        WHERE id = $1
+        RETURNING *`,
+    [flowId, stepId]
+);
+
+return res.rows[0];
+}
+
+module.exports = {
+    createFlow,
+    getFlow,
+    updateCurrentStep
+};
+===== ./onboarding/onboarding_step.repository.js =====
+const db = require("../../config/db");
+
+// CREATE OR UPDATE STEP DATA
+async function upsertStepData(client, flowId, stepId, data) {
+    const res = await client.query(
+        `
+        INSERT INTO onboarding_step_data (flow_id, step_id, data, status)
+        VALUES ($1, $2, $3, 'SUBMITTED')
+        ON CONFLICT (flow_id, step_id)
+        DO UPDATE SET 
+            data = EXCLUDED.data,
+            status = 'SUBMITTED',
+            updated_at = now()
+        RETURNING *;
+        `,
+        [flowId, stepId, data]
+    );
+
+    return res.rows[0];
+}
+
+// GET NEXT STEP
+async function getNextStep(client, templateId, currentStepOrder) {
+    const res = await client.query(
+        `
+        SELECT * FROM onboarding_template_steps
+        WHERE template_id = $1
+        AND step_order > $2
+        ORDER BY step_order ASC
+        LIMIT 1
+        `,
+        [templateId, currentStepOrder]
+    );
+
+    return res.rows[0];
+}
+
+async function getPreviousStep(client, templateId, currentStepOrder) {
+    const res = await client.query(
+        `
+        SELECT *
+        FROM onboarding_template_steps
+        WHERE template_id = $1
+        AND step_order < $2
+        ORDER BY step_order DESC
+        LIMIT 1
+        `,
+        [templateId, currentStepOrder]
+    );
+
+    return res.rows[0];
+}
+
+async function moveToPreviousStep(client, flowId, prevStepId) {
+    const res = await client.query(
+        `
+        UPDATE onboarding_flows
+        SET current_step_id = $2,
+            updated_at = now()
+        WHERE id = $1
+        RETURNING *
+        `,
+        [flowId, prevStepId]
+    );
+
+    return res.rows[0];
+}
+
+
+
+// GET STEP BY ID
+async function getStepById(client, stepId) {
+    const res = await client.query(
+        `SELECT * FROM onboarding_template_steps WHERE id = $1`,
+        [stepId]
+    );
+
+    return res.rows[0];
+}
+
+async function getCurrentStep(client, flowId) {
+    const res = await client.query(
+        `
+        SELECT s.*
+        FROM onboarding_flows f
+        JOIN onboarding_template_steps s
+            ON s.id = f.current_step_id
+        WHERE f.id = $1
+        `,
+        [flowId]
+    );
+
+    return res.rows[0];
+}
+async function completeFlow(client, flowId) {
+    const res = await client.query(
+        `
+        UPDATE onboarding_flows
+        SET status = 'COMPLETED',
+            updated_at = now()
+        WHERE id = $1
+        RETURNING *
+        `,
+        [flowId]
+    );
+
+    return res.rows[0];
+}
+// GET STEP DATA
+async function getStepData(client, flowId, stepId) {
+    const res = await client.query(
+        `SELECT * FROM onboarding_step_data
+         WHERE flow_id = $1 AND step_id = $2`,
+        [flowId, stepId]
+    );
+
+    return res.rows[0];
+}
+
+
+
+
+module.exports = {
+    upsertStepData,
+    getNextStep,
+    getPreviousStep,
+    moveToPreviousStep,
+    getStepById,
+    getCurrentStep,
+    completeFlow,
+    getStepData
+};
+===== ./onboarding/onboarding.service.js =====
+const { withTransaction } = require("../../config/transaction");
+const repo = require("./onboarding.repository");
+const roleRepo = require("../roles/role.repository");
+
+async function createTemplate(data) {
+    return withTransaction(async (client) => {
+
+        const { roleId, name, slug } = data;
+
+        if (!roleId || !name || !slug) {
+            throw new Error("roleId, name, slug are required");
+        }
+
+        // ensure role exists
+        const role = await roleRepo.getRoleById(client, roleId);
+        if (!role) throw new Error("Role does not exist");
+
+        return repo.createTemplate(client, data);
+    });
+}
+
+async function addStep(data) {
+    return withTransaction(async (client) => {
+
+        const { templateId, stepKey, stepOrder } = data;
+
+        if (!templateId || !stepKey || stepOrder === undefined) {
+            throw new Error("templateId, stepKey, stepOrder are required");
+        }
+        const existing = await client.query(
+        `SELECT 1 FROM onboarding_template_steps
+        WHERE template_id = $1 AND step_order = $2`,
+        [templateId, stepOrder]
+        );
+
+        if (existing.rows.length > 0) {
+        throw new Error("stepOrder already exists for this template");
+        }
+
+        return repo.addStep(client, data);
+    });
+}
+
+async function getTemplate(templateId) {
+    return withTransaction(async (client) =>{
+    const result = await repo.getTemplateWithSteps(client ,templateId);
+
+    // 🔒 ensure safe response shape
+    if (!result) return null;
+
+    return {
+        ...result,
+        steps: result.steps || []
+    };
+    })
+}
+
+module.exports = {
+    createTemplate,
+    addStep,
+    getTemplate
+};
+===== ./onboarding/onboarding_execution.controller.js =====
+const service = require("./onboarding_execution.service");
+const asyncHandler = require("../../utils/asyncHandler");
+
+const submitStep = asyncHandler(async (req, res) => {
+    const { flowId, stepId, data } = req.body;
+
+    const result = await service.submitStep(flowId, stepId, data);
+
+    res.json(result);
+});
+
+module.exports = {
+    submitStep
+};
+===== ./onboarding/onboarding.controller.js =====
+const service = require("./onboarding.service");
+const asyncHandler = require("../../utils/asyncHandler");
+
+// CREATE TEMPLATE
+const createTemplate = asyncHandler(async (req, res) => {
+    const result = await service.createTemplate(req.body);
+    res.status(201).json(result);
+});
+
+// ADD STEP
+const addStep = asyncHandler(async (req, res) => {
+    const result = await service.addStep(req.body);
+    res.status(201).json(result);
+});
+
+// GET TEMPLATE WITH STEPS
+const getTemplate = asyncHandler(async (req, res) => {
+    const result = await service.getTemplate(req.params.id);
+    res.json(result);
+});
+
+module.exports = {
+    createTemplate,
+    addStep,
+    getTemplate
+};
+===== ./onboarding/onboarding.repository.js =====
+const db = require("../../config/db");
+
+// CREATE TEMPLATE (aligned with DB)
+async function createTemplate(client, data) {
+    const {
+        roleId,
+        name,
+        slug,
+        requiresApproval = false,
+        isDefault = true
+    } = data;
+
+    const res = await client.query(
+        `INSERT INTO onboarding_templates
+        (role_id, name, slug, requires_approval, is_default)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING *`,
+        [roleId, name, slug, requiresApproval, isDefault]
+    );
+
+    return res.rows[0];
+}
+
+
+// ADD STEP (aligned with DB)
+async function addStep(client, data) {
+    const {
+        templateId,
+        stepKey,
+        stepOrder,
+        isRequired = true,
+        inputSchema = {},
+        config = {}
+    } = data;
+
+    const res = await client.query(
+        `INSERT INTO onboarding_template_steps
+        (template_id, step_key, step_order, is_required, input_schema, config)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING *`,
+        [templateId, stepKey, stepOrder, isRequired, inputSchema, config]
+    );
+
+    return res.rows[0];
+}
+
+
+// GET TEMPLATE WITH STEPS (READ MODEL)
+async function getTemplateWithSteps(client ,templateId) {
+    const res = await client.query(
+        `
+        SELECT 
+            t.*,
+            COALESCE(
+                json_agg(s ORDER BY s.step_order)
+                FILTER (WHERE s.id IS NOT NULL),
+                '[]'
+            ) AS steps
+        FROM onboarding_templates t
+        LEFT JOIN onboarding_template_steps s
+        ON t.id = s.template_id
+        WHERE t.id = $1
+        GROUP BY t.id
+        `,
+        [templateId]
+    );
+
+    return res.rows[0];
+}
+
+module.exports = {
+    createTemplate,
+    addStep,
+    getTemplateWithSteps
+};
+===== ./onboarding/onboarding_flow.service.js =====
+const { withTransaction } = require("../../config/transaction");
+
+const flowRepo = require("./onboarding_flow.repository");
+const templateRepo = require("./onboarding.repository");
+
+// CREATE FLOW
+async function startFlow(userRoleId, templateId) {
+    return withTransaction(async client => {
+
+        // 1. validate template exists
+        const template = await templateRepo.getTemplateWithSteps(client, templateId);
+        if (!template) throw new Error("Template not found");
+
+        // 2. get first step (optimized version recommended)
+        const firstStep = template.steps?.[0];
+
+        if (!firstStep) {
+            throw new Error("Template has no steps");
+        }
+
+        // 3. create flow
+        const flow = await flowRepo.createFlow(client, userRoleId, templateId);
+
+        // 4. set first step
+        await flowRepo.updateCurrentStep(client, flow.id, firstStep.id);
+
+        return {
+            flow,
+            currentStep: firstStep
+        };
+    });
+}
+
+// GET FLOW DETAIL
+async function getFlow(flowId) {
+    return await withTransaction(async client => {
+        return flowRepo.getFlow(client, flowId);
+    });
+}
+module.exports = {
+    startFlow,
+    getFlow
+};
+===== ./onboarding/onboarding_flow.routes.js =====
+const express = require("express");
+const router = express.Router();
+
+const controller = require("./onboarding_flow.controller");
+
+// start onboarding flow
+router.post("/start", controller.startFlow);
+
+// get flow
+router.get("/:id", controller.getFlow);
+
+module.exports = router;
+===== ./onboarding/onboarding.routes.js =====
+const express = require("express");
+const router = express.Router();
+
+const controller = require("./onboarding.controller");
+
+// create template
+router.post("/template", controller.createTemplate);
+
+// add step
+router.post("/step", controller.addStep);
+
+// get template with steps
+router.get("/template/:id", controller.getTemplate);
+
+module.exports = router;
+===== ./onboarding/onboarding_execution.service.js =====
+const { withTransaction } = require("../../config/transaction");
+
+const flowRepo = require("./onboarding_flow.repository");
+const stepRepo = require("./onboarding_step.repository");
+
+// SUBMIT STEP
+async function submitStep(flowId, stepId, data) {
+    return withTransaction(async (client) => {
+
+        // 1. get flow
+        const flow = await flowRepo.getFlow(flowId);
+        if (!flow) throw new Error("Flow not found");
+
+        // 2. get current step
+const currentStep = await stepRepo.getCurrentStep(client, flowId);
+
+        if (!currentStep) throw new Error("Step not found");
+
+        if (currentStep.id !== stepId) throw new Error("Invalid step");
+        // 3. save data
+
+
+        // validate
+        validate(currentStep.input_schema , data)
+        await stepRepo.upsertStepData(client, flowId, stepId, data);
+
+        // 4. get next step
+        const nextStep = await stepRepo.getNextStep(
+            client,
+            flow.template_id,
+            currentStep.step_order
+        );
+
+        // 5. move flow forward
+        if (nextStep) {
+            await flowRepo.updateCurrentStep(client, flowId, nextStep.id);
+
+            return {
+                message: "Step completed",
+                nextStep
+            };
+        } else {
+            // no more steps → complete flow
+            await client.query(
+                `UPDATE onboarding_flows
+                 SET status = 'COMPLETED',
+                     updated_at = now()
+                 WHERE id = $1`,
+                [flowId]
+            );
+
+            return {
+                message: "Onboarding completed"
+            };
+        }
+    });
+}
+
+module.exports = {
+    submitStep
+};

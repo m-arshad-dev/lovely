@@ -1,0 +1,1776 @@
+===== ./utils/asyncHandler.js =====
+module.exports = fn => (req, res, next) =>
+    Promise.resolve(fn(req, res, next)).catch(next);
+
+
+// src/utils/asyncHandler.js
+
+// const asyncHandler = (fn) => {
+//     return (req, res, next) => {
+//         Promise.resolve(fn(req, res, next)).catch(next);
+//     };
+// };
+
+// module.exports = asyncHandler;===== ./utils/logger.js =====
+const logger = (req, res, next) => {
+  const start = Date.now();
+
+  // Log Incoming Request
+  console.log("----- Incoming Request -----");
+  console.log("Time:", new Date().toISOString());
+  console.log("Method:", req.method);
+  console.log("URL:", req.originalUrl);
+  console.log("Headers:", req.headers);
+  console.log("Query:", req.query);
+  console.log("Body:", req.body);
+
+  // Capture response body
+  const originalSend = res.send;
+
+  let responseBody;
+
+  res.send = function (body) {
+    responseBody = body;
+    return originalSend.call(this, body);
+  };
+
+  // When response finishes
+  res.on("finish", () => {
+    const duration = Date.now() - start;
+
+    console.log("----- Outgoing Response -----");
+    console.log("Time:", new Date().toISOString());
+    console.log("Status:", res.statusCode);
+    console.log("Headers:", res.getHeaders());
+    console.log("Response Body:", responseBody);
+    console.log("Duration:", duration + "ms");
+    console.log("--------------------------------\n");
+  });
+
+  next();
+};
+
+module.exports = logger;===== ./utils/apiResponse.js =====
+function success(type , data={}){
+    return {
+        success: true,
+        type,
+        data,
+        errors: null
+    }
+}
+
+function fail(type, error = {}) {
+    return {
+        success: false,
+        type,
+        error
+    };
+}
+
+
+module.exports ={
+    success,
+    fail
+}===== ./utils/authMiddleware.js =====
+const jwt = require('jsonwebtoken');
+const db = require('../config/db');
+
+const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret_change_me';
+
+async function authenticate(req, res, next) {
+  const auth = req.headers.authorization;
+  if (!auth || !auth.startsWith('Bearer ')) return res.status(401).json({ error: 'Unauthorized' });
+
+  const token = auth.slice(7);
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.user = { id: payload.sub };
+
+    // attach roles (outside transaction)
+    const rolesRes = await db.query(
+      `SELECT r.*, ur.is_active, ur.id AS user_role_id
+       FROM roles r
+       JOIN user_roles ur ON r.id = ur.role_id
+       WHERE ur.user_id = $1`,
+      [req.user.id]
+    );
+    req.user.roles = rolesRes.rows || [];
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: 'Invalid token' });
+  }
+}
+
+function requireRole(roleName) {
+  return (req, res, next) => {
+    const roles = (req.user && req.user.roles) || [];
+    if (roles.find(r=>r.name === roleName)) return next();
+    return res.status(403).json({ error: 'Forbidden' });
+  };
+}
+
+module.exports = { authenticate, requireRole };
+===== ./utils/schemaValidator.js =====
+function validate(schema, data) {
+    if (!schema || !schema.fields) return null;
+
+    const errors = {};
+
+    for (const field of schema.fields) {
+        const value = data[field.name];
+
+        // Required
+        if (field.required && (value === undefined || value === null || value === "")) {
+            errors[field.name] = `${field.name} is required`;
+            continue;
+        }
+
+        if (value === undefined || value === null) continue;
+
+        // Type
+        if (field.type === "number" && typeof value !== "number") {
+            errors[field.name] = `${field.name} must be a number`;
+        }
+
+        if (field.type === "string" && typeof value !== "string") {
+            errors[field.name] = `${field.name} must be a string`;
+        }
+
+        if (field.type === "boolean" && typeof value !== "boolean") {
+            errors[field.name] = `${field.name} must be a boolean`;
+        }
+
+        // Min length
+        if (field.minLength && typeof value === "string") {
+            if (value.length < field.minLength) {
+                errors[field.name] = `${field.name} must be at least ${field.minLength} characters`;
+            }
+        }
+    }
+
+    return Object.keys(errors).length > 0 ? errors : null;
+}
+
+module.exports = { validate };===== ./utils/permissionMiddleware.js =====
+const db = require('../config/db');
+
+function requirePermission(permissionName) {
+  return async (req, res, next) => {
+    if (!req.user || !req.user.roles) return res.status(401).json({ error: 'Unauthorized' });
+
+    const roleIds = (req.user.roles || [])
+      .filter(r => r.is_active)
+      .map(r => r.id);
+
+    if (roleIds.length === 0) return res.status(403).json({ error: 'Forbidden' });
+
+    const q = `SELECT 1 FROM role_permissions rp JOIN permissions p ON rp.permission_id = p.id WHERE rp.role_id = ANY($1::int[]) AND p.name = $2 LIMIT 1`;
+    const result = await db.query(q, [roleIds, permissionName]);
+    if (result.rows.length > 0) return next();
+
+    return res.status(403).json({ error: 'Forbidden' });
+  };
+}
+
+module.exports = { requirePermission };
+===== ./config/transaction.js =====
+const db = require('./db');
+
+async function withTransaction(callback) {
+    const client =await db.connect();
+
+    try{
+        await client.query('BEGIN');
+
+        const result = await callback(client);
+
+        await client.query('COMMIT')
+        return result;
+
+
+    }catch(err) {
+        await client.query('ROLLBACK')
+        throw  err
+    }finally{
+        client.release()
+    }
+}
+
+module.exports = {withTransaction}===== ./config/db.js =====
+const {Pool} = require('pg')
+
+const pool = new Pool({
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    port: process.env.DB_PORT,
+    host: process.env.DB_HOST,
+    database: process.env.DB_NAME
+});
+
+pool.connect()
+    .then(client =>{
+        console.log('Conneted to the database');
+        client.release();
+    })
+    .catch(err => {
+        console.log('error occured while connecting to the database' , err)
+    });
+
+module.exports = pool;
+===== ./modules/users/user.routes.js =====
+const express = require("express");
+const router = express.Router();
+
+const userController = require("./user.controller");
+
+// 🔐 auth middleware (YOU MUST HAVE THIS)
+const authMiddleware = require("../../middlewares/auth");
+
+// Create user (optional / admin use only)
+router.post("/", userController.createUser);
+
+// Get user by id (protected)
+router.get("/:id", authMiddleware, userController.getUser);
+
+// 🔥 Assign role (CRITICAL FLOW - MUST BE AUTHENTICATED)
+router.post(
+  "/assign-role",
+  authMiddleware,
+  userController.assignRole
+);
+
+module.exports = router;===== ./modules/users/user.service.js =====
+const { withTransaction } = require("../../config/transaction");
+
+const userRepo = require("./user.repository");
+const roleRepo = require("../roles/role.repository");
+const userRoleRepo = require("../user_roles/userRole.repository");
+const rolePermissionRepo = require("../roles/rolePermission.repository");
+
+const bcrypt = require("bcrypt");
+
+const SALT_ROUNDS = 10;
+
+//
+// 🟢 CREATE USER (REGISTER FLOW)
+//
+async function createUser(data) {
+  return withTransaction(async (client) => {
+    try {
+      const hash = await bcrypt.hash(data.password, SALT_ROUNDS);
+
+      const user = await userRepo.createUser(
+        client,
+        data.name,
+        data.email,
+        hash
+      );
+
+      // no role assignment here (handled later in /assign-role flow)
+
+      return user;
+    } catch (err) {
+      if (err.code === "23505") {
+        throw new Error("User already exists");
+      }
+      throw err;
+    }
+  });
+}
+
+//
+// 🟢 ASSIGN ROLE (CRITICAL FLOW AFTER REGISTRATION)
+//
+async function assignRoleToUser(userId, roleId) {
+  return withTransaction(async (client) => {
+    const user = await userRepo.getUserById(client, userId);
+    if (!user) throw new Error("User not found");
+
+    const role = await roleRepo.getRoleById(client, roleId);
+    if (!role) throw new Error("Role not found");
+
+    // assign role
+    await userRoleRepo.assignRole(client, userId, roleId);
+
+    // reload updated roles
+    const roles = await userRoleRepo.getUserRoles(client, userId);
+    const roleIds = roles.map((r) => r.role_id || r.id);
+
+    // load permissions
+    const permissions =
+      await rolePermissionRepo.getPermissionsForRoles(client, roleIds);
+
+    const updatedUser = await userRepo.getUserById(client, userId);
+
+    return {
+      user: updatedUser,
+      roles,
+      permissions,
+      needsRoleSelection: false,
+    };
+  });
+}
+
+//
+// 🟢 GET USER PROFILE
+//
+async function getUserProfile(userId) {
+  return withTransaction(async (client) => {
+    const user = await userRepo.getUserById(client, userId);
+
+    if (!user) throw new Error("User not found");
+
+    const roles = await userRoleRepo.getUserRoles(client, userId);
+
+    const roleIds = roles.map((r) => r.role_id || r.id);
+
+    const permissions =
+      await rolePermissionRepo.getPermissionsForRoles(client, roleIds);
+
+    return {
+      ...user,
+      roles,
+      permissions,
+    };
+  });
+}
+
+module.exports = {
+  getUserProfile,
+  createUser,
+  assignRoleToUser,
+};===== ./modules/users/user.controller.js =====
+const service = require("./user.service");
+const asyncHandler = require("../../utils/asyncHandler");
+const { success } = require("../../utils/apiResponse");
+
+// Create user (optional, usually not primary if using auth/register)
+const createUser = asyncHandler(async (req, res) => {
+  const user = await service.createUser(req.body);
+  res.status(201).json(success("userCreated", user));
+});
+
+// 🔥 Assign Role (CRITICAL FLOW)
+const assignRole = asyncHandler(async (req, res) => {
+  // ✅ Get userId from authenticated request (set by auth middleware)
+  const userId = req.user?.id;
+
+  // ❗ Only roleId comes from client
+  const roleId = Number(req.body.roleId);
+
+  if (!userId) {
+    throw new Error("Unauthorized: user not found in token");
+  }
+
+  if (isNaN(roleId)) {
+    throw new Error("Invalid roleId");
+  }
+
+  const result = await service.assignRoleToUser(userId, roleId);
+
+  // ✅ Return FULL SESSION DATA
+  res.status(200).json(success("roleAssigned", result));
+});
+
+// Get user profile
+const getUser = asyncHandler(async (req, res) => {
+  const result = await service.getUserProfile(req.params.id);
+  res.json(success("userFetched", result));
+});
+
+module.exports = {
+  createUser,
+  assignRole,
+  getUser,
+};===== ./modules/users/user.repository.js =====
+const db = require("../../config/db");
+
+async function createUser(client, name, email, passwordHash) {
+    const res = await client.query(
+        `INSERT INTO users (name, email, password_hash)
+         VALUES ($1, $2, $3)
+         RETURNING *`,
+        [name, email, passwordHash]
+    );
+
+    return res.rows[0];
+}
+
+async function getUserById(client, id) {
+    const res = await client.query(
+        `SELECT * FROM users WHERE id = $1`,
+        [id]
+    );
+
+    return res.rows[0];
+}
+
+// OUTSIDE TRANSACTION SAFE READ
+async function getUserByIdSafe(id) {
+    const res = await db.query(
+        `SELECT * FROM users WHERE id = $1`,
+        [id]
+    );
+
+    return res.rows[0];
+}
+
+async function getUserByEmail(client, email) {
+    const res = await client.query(
+        `SELECT * FROM users WHERE email = $1`,
+        [email]
+    );
+
+    return res.rows[0];
+}
+
+module.exports = {
+    createUser,
+    getUserById,
+    getUserByEmail,
+    getUserByIdSafe
+};===== ./modules/steps/steps.routes.js =====
+const express = require('express');
+const router = express.Router();
+const { authenticate } = require('../../utils/authMiddleware');
+const controller = require('./steps.controller');
+
+router.get('/:id', authenticate, controller.getStepById);
+
+module.exports = router;
+===== ./modules/steps/steps.controller.js =====
+const { success } = require('../../utils/apiResponse');
+const asyncHandler = require('../../utils/asyncHandler');
+const db = require('../../config/db');
+const stepRepo = require('../onboarding/onboarding_step.repository');
+
+const getStepById = asyncHandler(async (req, res) => {
+  const stepId = Number(req.params.id);
+
+  if (Number.isNaN(stepId)) {
+    throw new Error('Invalid step id');
+  }
+
+  const step = await stepRepo.getStepById(db, stepId);
+
+  if (!step) {
+    throw new Error('Step not found');
+  }
+
+  res.json(success('stepFetched', step));
+});
+
+module.exports = {
+  getStepById,
+};
+===== ./modules/roles/rolePermission.repository.js =====
+const db = require('../../config/db');
+
+async function getPermissionsForRole(client, roleId) {
+  const res = await client.query(
+    `SELECT p.* FROM permissions p
+     JOIN role_permissions rp ON rp.permission_id = p.id
+     WHERE rp.role_id = $1`,
+    [roleId]
+  );
+
+  return res.rows;
+}
+
+async function getPermissionsForRoles(client, roleIds) {
+  if (!roleIds || roleIds.length === 0) return [];
+  const res = await client.query(
+    `SELECT DISTINCT p.* FROM permissions p
+     JOIN role_permissions rp ON rp.permission_id = p.id
+     WHERE rp.role_id = ANY($1::int[])`,
+    [roleIds]
+  );
+  return res.rows;
+}
+
+module.exports = {
+  getPermissionsForRole,
+  getPermissionsForRoles,
+};
+===== ./modules/roles/role.routes.js =====
+const express = require("express");
+const router = express.Router();
+
+const roleController = require("./role.controller");
+
+// GET all roles
+router.get("/", roleController.getRoles);
+
+// GET role by id
+router.get("/:id", roleController.getRole);
+
+module.exports = router;===== ./modules/roles/role.repository.js =====
+async function getRoleById(client, id) {
+    const res = await client.query(
+        `SELECT * FROM roles WHERE id = $1`,
+        [id]
+    );
+
+    return res.rows[0];
+}
+
+async function getAllRoles(client) {
+    const res = await client.query(
+        `SELECT * FROM roles`,
+    );
+
+    return res.rows;
+}
+
+module.exports = {
+    getAllRoles,
+    getRoleById
+};===== ./modules/roles/role.controller.js =====
+const roleService = require("./role.service");
+const asyncHandler = require('../../utils/asyncHandler')
+const { success } = require("../../utils/apiResponse");
+
+
+const getRoles = asyncHandler(async (req ,res)=>{
+    const roles = await roleService.getAllRoles();
+    res.json(success("rolesFetched", roles));
+})
+
+
+const getRole = asyncHandler(async  (req, res)=> {
+    const role = await roleService.getRoleById(req.params.id);
+    res.json(success("roleFetched", role));
+});
+
+module.exports = {
+  getRoles,
+  getRole
+};===== ./modules/roles/role.service.js =====
+const { withTransaction } = require('../../config/transaction');
+const roleRepo = require('./role.repository');
+
+async function getAllRoles() {
+return withTransaction(async (client) =>{
+            const roles = await roleRepo.getAllRoles(client);
+
+        if (roles.length === 0) {
+            throw new Error("No roles exist in the system");
+        }
+        return roles;
+})
+
+}
+
+async function getRoleById(id) {
+return withTransaction(async (client) => {
+            const role = await roleRepo.getRoleById(client ,id);
+
+        if (!role) {
+            throw new Error("Role not found");
+        }
+
+        return role;
+})
+}
+
+module.exports = {
+    getAllRoles,
+    getRoleById
+};===== ./modules/user_roles/userRole.repository.js =====
+async function assignRole(client, userId, roleId) {
+
+    const check = await client.query(
+        `SELECT 1 FROM user_roles
+         WHERE user_id = $1 AND role_id = $2`,
+        [userId, roleId]
+    );
+
+    if (check.rows.length > 0) {
+        throw new Error("Role already assigned");
+    }
+
+    const res = await client.query(
+        `INSERT INTO user_roles (user_id, role_id)
+         VALUES ($1, $2)
+         RETURNING *`,
+        [userId, roleId]
+    );
+
+    return res.rows[0];
+}
+
+async function getUserRoles(client, userId) {
+    const res = await client.query(
+        `SELECT r.*, ur.is_active, ur.id AS user_role_id
+         FROM roles r
+         JOIN user_roles ur ON r.id = ur.role_id
+         WHERE ur.user_id = $1`,
+        [userId]
+    );
+
+    return res.rows;
+}
+
+async function getUserRoleById(client, userRoleId) {
+    const res = await client.query(
+        `SELECT * FROM user_roles WHERE id = $1`,
+        [userRoleId]
+    );
+
+    return res.rows[0];
+}
+
+async function activateRole(client, userRoleId) {
+    await client.query(
+        `UPDATE user_roles
+         SET is_active = true,
+             activated_at = now()
+         WHERE id = $1`,
+        [userRoleId]
+    );
+}
+
+module.exports = {
+    assignRole,
+    getUserRoles,
+    activateRole
+};===== ./modules/onboarding/onboarding_execution.routes.js =====
+const express = require("express");
+const router = express.Router();
+
+const { authenticate } = require("../../utils/authMiddleware");
+const controller = require("./onboarding_execution.controller");
+
+// 🟢 Submit onboarding step (runtime execution)
+router.post("/submit", authenticate, controller.submitStep);
+router.post("/:flowId/steps/:stepId/submit", authenticate, controller.submitStep);
+router.get("/:flowId/steps/:stepId", authenticate, controller.getStepData);
+
+// (optional future expansion)
+// router.get("/progress/:flowId", authenticate, controller.getProgress);
+// router.get("/current-step/:flowId", authenticate, controller.getCurrentStep);
+
+module.exports = router;===== ./modules/onboarding/onboarding_flow.controller.js =====
+const service = require("./onboarding_flow.service");
+const asyncHandler = require("../../utils/asyncHandler");
+const { success } = require("../../utils/apiResponse");
+
+const startFlow = asyncHandler(async (req, res) => {
+    const { userRoleId, templateId, user_role_id, template_id } = req.body;
+    const normalizedUserRoleId = userRoleId || user_role_id;
+    const normalizedTemplateId = templateId || template_id;
+
+    const result = await service.startFlow(req.user.id, normalizedUserRoleId, normalizedTemplateId);
+
+    res.status(201).json(success("flowStarted", result));
+});
+
+const getFlow = asyncHandler(async (req, res) => {
+    const result = await service.getFlow(req.user.id, req.params.id);
+    res.json(success("flowFetched", result));
+
+});
+
+module.exports = {
+    startFlow,
+    getFlow
+};===== ./modules/onboarding/onboarding_flow.repository.js =====
+const db = require("../../config/db");
+
+// CREATE FLOW
+async function createFlow(client, userRoleId, templateId) {
+    const res = await client.query(
+        `INSERT INTO onboarding_flows (user_role_id, template_id, status)
+        VALUES ($1, $2, 'IN_PROGRESS')
+         RETURNING *`,
+        [userRoleId, templateId]
+    );
+
+    return res.rows[0];
+}
+
+// GET FLOW
+async function getFlow(client ,flowId) {
+    const res = await client.query(
+        `SELECT f.*, t.requires_approval
+         FROM onboarding_flows f
+         JOIN onboarding_templates t ON t.id = f.template_id
+         WHERE f.id = $1`,
+        [flowId]
+    );
+
+    return res.rows[0];
+}
+
+// UPDATE CURRENT STEP
+async function updateCurrentStep(client, flowId, stepId) {
+const res = await client.query(
+    `UPDATE onboarding_flows
+        SET current_step_id = $2,
+            updated_at = now()
+        WHERE id = $1
+        RETURNING *`,
+    [flowId, stepId]
+);
+
+return res.rows[0];
+}
+
+async function updateStatus(client, flowId, status) {
+    const res = await client.query(
+        `UPDATE onboarding_flows
+            SET status = $2,
+                updated_at = now()
+            WHERE id = $1
+            RETURNING *`,
+        [flowId, status]
+    );
+
+    return res.rows[0];
+}
+
+module.exports = {
+    createFlow,
+    getFlow,
+    updateCurrentStep
+};===== ./modules/onboarding/onboarding_step.repository.js =====
+const db = require("../../config/db");
+
+// CREATE OR UPDATE STEP DATA
+async function upsertStepData(client, flowId, stepId, data) {
+    const res = await client.query(
+        `
+        INSERT INTO onboarding_step_data (flow_id, step_id, data, status)
+        VALUES ($1, $2, $3, 'SUBMITTED')
+        ON CONFLICT (flow_id, step_id)
+        DO UPDATE SET 
+            data = EXCLUDED.data,
+            status = 'SUBMITTED',
+            updated_at = now()
+        RETURNING *;
+        `,
+        [flowId, stepId, data]
+    );
+
+    return res.rows[0];
+}
+
+// GET NEXT STEP
+async function getNextStep(client, templateId, currentStepOrder) {
+    const res = await client.query(
+        `
+        SELECT * FROM onboarding_template_steps
+        WHERE template_id = $1
+        AND step_order > $2
+        ORDER BY step_order ASC
+        LIMIT 1
+        `,
+        [templateId, currentStepOrder]
+    );
+
+    return res.rows[0];
+}
+
+async function getPreviousStep(client, templateId, currentStepOrder) {
+    const res = await client.query(
+        `
+        SELECT *
+        FROM onboarding_template_steps
+        WHERE template_id = $1
+        AND step_order < $2
+        ORDER BY step_order DESC
+        LIMIT 1
+        `,
+        [templateId, currentStepOrder]
+    );
+
+    return res.rows[0];
+}
+
+async function moveToPreviousStep(client, flowId, prevStepId) {
+    const res = await client.query(
+        `
+        UPDATE onboarding_flows
+        SET current_step_id = $2,
+            updated_at = now()
+        WHERE id = $1
+        RETURNING *
+        `,
+        [flowId, prevStepId]
+    );
+
+    return res.rows[0];
+}
+
+
+
+// GET STEP BY ID
+async function getStepById(client, stepId) {
+    const res = await client.query(
+        `SELECT * FROM onboarding_template_steps WHERE id = $1`,
+        [stepId]
+    );
+
+    return res.rows[0];
+}
+
+async function getCurrentStep(client, flowId) {
+    const res = await client.query(
+        `
+        SELECT s.*
+        FROM onboarding_flows f
+        JOIN onboarding_template_steps s
+            ON s.id = f.current_step_id
+        WHERE f.id = $1
+        `,
+        [flowId]
+    );
+
+    return res.rows[0];
+}
+async function completeFlow(client, flowId) {
+    const res = await client.query(
+        `
+        UPDATE onboarding_flows
+        SET status = 'COMPLETED',
+            updated_at = now()
+        WHERE id = $1
+        RETURNING *
+        `,
+        [flowId]
+    );
+
+    return res.rows[0];
+}
+// GET STEP DATA
+async function getStepData(client, flowId, stepId) {
+    const res = await client.query(
+        `SELECT * FROM onboarding_step_data
+         WHERE flow_id = $1 AND step_id = $2`,
+        [flowId, stepId]
+    );
+
+    return res.rows[0];
+}
+
+
+
+
+module.exports = {
+    upsertStepData,
+    getNextStep,
+    getPreviousStep,
+    moveToPreviousStep,
+    getStepById,
+    getCurrentStep,
+    completeFlow,
+    getStepData
+};===== ./modules/onboarding/onboarding.service.js =====
+const { withTransaction } = require("../../config/transaction");
+const repo = require("./onboarding.repository");
+const roleRepo = require("../roles/role.repository");
+
+async function createTemplate(data) {
+    return withTransaction(async (client) => {
+
+        const { roleId, role_id, name, slug } = data;
+        const normalizedRoleId = roleId || role_id;
+
+        if (!normalizedRoleId || !name || !slug) {
+            throw new Error("roleId, name, slug are required");
+        }
+
+        const role = await roleRepo.getRoleById(client, normalizedRoleId);
+        if (!role) throw new Error("Role does not exist");
+
+        return repo.createTemplate(client, {
+            ...data,
+            roleId: normalizedRoleId,
+        });
+    });
+}
+
+async function addStep(data) {
+    return withTransaction(async (client) => {
+
+        const {
+            templateId,
+            template_id,
+            stepKey,
+            step_key,
+            stepOrder,
+            step_order,
+        } = data;
+        const normalizedTemplateId = templateId || template_id;
+        const normalizedStepKey = stepKey || step_key;
+        const normalizedStepOrder = stepOrder !== undefined ? stepOrder : step_order;
+
+        if (!normalizedTemplateId || !normalizedStepKey || normalizedStepOrder === undefined) {
+            throw new Error("templateId, stepKey, stepOrder are required");
+        }
+        const existing = await client.query(
+        `SELECT 1 FROM onboarding_template_steps
+        WHERE template_id = $1 AND step_order = $2`,
+        [normalizedTemplateId, normalizedStepOrder]
+        );
+
+        if (existing.rows.length > 0) {
+            throw new Error("stepOrder already exists for this template");
+        }
+
+        return repo.addStep(client, {
+            ...data,
+            templateId: normalizedTemplateId,
+            stepKey: normalizedStepKey,
+            stepOrder: normalizedStepOrder,
+        });
+    });
+}
+
+async function getTemplate(templateId) {
+    return withTransaction(async (client) =>{
+    const result = await repo.getTemplateWithSteps(client ,templateId);
+
+    // 🔒 ensure safe response shape
+    if (!result) return null;
+
+    return {
+        ...result,
+        steps: result.steps || []
+    };
+    })
+}
+
+async function getDefaultTemplate(roleId) {
+    return withTransaction(async (client) => {
+        const result = await repo.getDefaultTemplateByRole(client, roleId);
+        if (!result) return null;
+
+        return {
+            ...result,
+            steps: result.steps || []
+        };
+    });
+}
+
+module.exports = {
+    createTemplate,
+    addStep,
+    getTemplate,
+    getDefaultTemplate
+};===== ./modules/onboarding/onboarding_execution.controller.js =====
+const { success } = require("../../utils/apiResponse");
+const asyncHandler = require("../../utils/asyncHandler");
+const service = require("./onboarding_execution.service");
+
+// 🟢 Submit onboarding step (runtime execution)
+const submitStep = asyncHandler(async (req, res) => {
+  const flowId = req.body.flowId || req.params.flowId;
+  const stepId = req.body.stepId || req.params.stepId;
+  const data = req.body.data || {};
+
+  const userId = req.user?.id;
+
+  if (!flowId || !stepId) {
+    throw new Error("flowId and stepId are required");
+  }
+
+  if (!userId) {
+    throw new Error("Unauthorized user");
+  }
+
+  const result = await service.submitStep(
+    flowId,
+    stepId,
+    data,
+    userId
+  );
+
+  if (result.type === "validationFailed") {
+    return res.status(400).json(success("stepValidationFailed", result));
+  }
+
+  res.json(success("stepSubmitted", result));
+});
+
+const getStepData = asyncHandler(async (req, res) => {
+  const flowId = req.params.flowId;
+  const stepId = req.params.stepId;
+  const userId = req.user?.id;
+
+  if (!flowId || !stepId) {
+    throw new Error("flowId and stepId are required");
+  }
+
+  if (!userId) {
+    throw new Error("Unauthorized user");
+  }
+
+  const result = await service.getStepData(flowId, stepId, userId);
+  res.json(success("stepDataFetched", result));
+});
+
+module.exports = {
+  submitStep,
+  getStepData,
+};===== ./modules/onboarding/onboarding.controller.js =====
+const service = require("./onboarding.service");
+const asyncHandler = require("../../utils/asyncHandler");
+const { success } = require("../../utils/apiResponse");
+
+// CREATE TEMPLATE
+const createTemplate = asyncHandler(async (req, res) => {
+    const result = await service.createTemplate(req.body);
+    res.status(201).json(success("templateCreated", result));
+});
+
+// ADD STEP
+const addStep = asyncHandler(async (req, res) => {
+    const result = await service.addStep(req.body);
+    res.status(201).json(success("stepAdded", result));
+});
+
+// GET TEMPLATE WITH STEPS
+const getTemplate = asyncHandler(async (req, res) => {
+    const result = await service.getTemplate(req.params.id);
+    res.json(success("templateFetched", result));
+});
+
+const getDefaultTemplate = asyncHandler(async (req, res) => {
+    const result = await service.getDefaultTemplate(req.params.roleId);
+    res.json(success("defaultTemplateFetched", result));
+});
+
+module.exports = {
+    createTemplate,
+    addStep,
+    getTemplate,
+    getDefaultTemplate
+};===== ./modules/onboarding/onboarding.repository.js =====
+const db = require("../../config/db");
+
+// CREATE TEMPLATE (aligned with DB)
+async function createTemplate(client, data) {
+    const {
+        roleId,
+        name,
+        slug,
+        requiresApproval = false,
+        isDefault = true
+    } = data;
+
+    const res = await client.query(
+        `INSERT INTO onboarding_templates
+        (role_id, name, slug, requires_approval, is_default)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING *`,
+        [roleId, name, slug, requiresApproval, isDefault]
+    );
+
+    return res.rows[0];
+}
+
+
+// ADD STEP (aligned with DB)
+async function addStep(client, data) {
+    const {
+        templateId,
+        stepKey,
+        stepOrder,
+        isRequired = true,
+        inputSchema = {},
+        config = {}
+    } = data;
+
+    const res = await client.query(
+        `INSERT INTO onboarding_template_steps
+        (template_id, step_key, step_order, is_required, input_schema, config)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING *`,
+        [templateId, stepKey, stepOrder, isRequired, inputSchema, config]
+    );
+
+    return res.rows[0];
+}
+
+
+// GET TEMPLATE WITH STEPS (READ MODEL)
+async function getTemplateWithSteps(client ,templateId) {
+    const res = await client.query(
+        `
+        SELECT 
+            t.*,
+            COALESCE(
+                json_agg(s ORDER BY s.step_order)
+                FILTER (WHERE s.id IS NOT NULL),
+                '[]'
+            ) AS steps
+        FROM onboarding_templates t
+        LEFT JOIN onboarding_template_steps s
+        ON t.id = s.template_id
+        WHERE t.id = $1
+        GROUP BY t.id
+        `,
+        [templateId]
+    );
+
+    return res.rows[0];
+}
+
+async function getDefaultTemplateByRole(client, roleId) {
+    const res = await client.query(
+        `
+        SELECT 
+            t.*, 
+            COALESCE(
+                json_agg(s ORDER BY s.step_order)
+                FILTER (WHERE s.id IS NOT NULL),
+                '[]'
+            ) AS steps
+        FROM onboarding_templates t
+        LEFT JOIN onboarding_template_steps s
+            ON t.id = s.template_id
+        WHERE t.role_id = $1
+          AND t.is_default = true
+          AND t.is_active = true
+        GROUP BY t.id
+        `,
+        [roleId]
+    );
+
+    return res.rows[0] || null;
+}
+
+module.exports = {
+    createTemplate,
+    addStep,
+    getTemplateWithSteps,
+    getDefaultTemplateByRole
+};===== ./modules/onboarding/onboarding_flow.service.js =====
+const { withTransaction } = require("../../config/transaction");
+
+const flowRepo = require("./onboarding_flow.repository");
+const templateRepo = require("./onboarding.repository");
+
+// CREATE FLOW
+const userRoleRepo = require('../user_roles/userRole.repository');
+
+async function startFlow(userId, userRoleId, templateId) {
+    return withTransaction(async client => {
+        const userRole = await userRoleRepo.getUserRoleById(client, userRoleId);
+        if (!userRole) throw new Error('User role not found');
+        if (userRole.user_id !== userId) throw new Error('Forbidden');
+        if (userRole.is_active) throw new Error('Role is already active');
+
+        const template = templateId
+            ? await templateRepo.getTemplateWithSteps(client, templateId)
+            : await templateRepo.getDefaultTemplateByRole(client, userRole.role_id || userRole.roleId);
+
+        if (!template) throw new Error("Template not found");
+
+        const firstStep = template.steps?.[0];
+        if (!firstStep) {
+            throw new Error("Template has no steps");
+        }
+
+        const flow = await flowRepo.createFlow(client, userRoleId, template.id);
+        const updatedFlow = await flowRepo.updateCurrentStep(client, flow.id, firstStep.id);
+
+        return {
+            flow: {
+                ...updatedFlow,
+                requires_approval: template.requires_approval || false,
+            },
+            currentStep: firstStep,
+        };
+    });
+}
+
+// GET FLOW DETAIL
+async function getFlow(userId, flowId) {
+    return await withTransaction(async client => {
+        const flow = await flowRepo.getFlow(client, flowId);
+        if (!flow) throw new Error('Flow not found');
+
+        const userRole = await userRoleRepo.getUserRoleById(client, flow.user_role_id);
+        if (!userRole || userRole.user_id !== userId) {
+            throw new Error('Forbidden');
+        }
+
+        return flow;
+    });
+}
+module.exports = {
+    startFlow,
+    getFlow
+};===== ./modules/onboarding/onboarding_flow.routes.js =====
+const express = require("express");
+const router = express.Router();
+const { authenticate } = require('../../utils/authMiddleware');
+
+const controller = require("./onboarding_flow.controller");
+
+// start onboarding flow
+router.post("/start", authenticate, controller.startFlow);
+
+// get flow
+router.get("/:id", authenticate, controller.getFlow);
+
+module.exports = router;===== ./modules/onboarding/onboarding.routes.js =====
+const express = require("express");
+const router = express.Router();
+
+const controller = require("./onboarding.controller");
+const { authenticate } = require('../../utils/authMiddleware');
+const { requirePermission } = require('../../utils/permissionMiddleware');
+
+// create template (requires onboarding:manage)
+router.post("/template", authenticate, requirePermission('onboarding:manage'), controller.createTemplate);
+
+// add step (requires onboarding:manage)
+router.post("/step", authenticate, requirePermission('onboarding:manage'), controller.addStep);
+
+// get template with steps
+router.get("/template/:id", controller.getTemplate);
+
+// get default template for a role
+router.get("/template/default/:roleId", controller.getDefaultTemplate);
+
+module.exports = router;===== ./modules/onboarding/onboarding_execution.service.js =====
+const { withTransaction } = require("../../config/transaction");
+const { validate } = require("../../utils/schemaValidator");
+
+const flowRepo = require("./onboarding_flow.repository");
+const stepRepo = require("./onboarding_step.repository");
+const templateRepo = require("./onboarding.repository");
+const userRoleRepo = require("../user_roles/userRole.repository");
+
+async function submitStep(flowId, stepId, data, userId) {
+  flowId = Number(flowId);
+  stepId = Number(stepId);
+
+  if (isNaN(flowId) || isNaN(stepId)) {
+    throw new Error("Invalid flowId or stepId");
+  }
+
+  return withTransaction(async (client) => {
+    const flow = await flowRepo.getFlow(client, flowId);
+    if (!flow) throw new Error("Flow not found");
+
+    const userRole = await userRoleRepo.getUserRoleById(
+      client,
+      flow.user_role_id
+    );
+
+    if (!userRole || userRole.user_id !== userId) {
+      throw new Error("Forbidden");
+    }
+
+    const currentStep = await stepRepo.getCurrentStep(client, flowId);
+    if (!currentStep) throw new Error("Step not found");
+
+    if (currentStep.id !== stepId) {
+      throw new Error("Invalid step");
+    }
+
+    const errors = validate(currentStep.input_schema || {}, data);
+    if (errors) {
+      return {
+        type: "validationFailed",
+        errors,
+      };
+    }
+
+    await stepRepo.upsertStepData(client, flowId, stepId, data);
+
+    const nextStep = await stepRepo.getNextStep(
+      client,
+      flow.template_id,
+      currentStep.step_order
+    );
+
+    if (nextStep) {
+      await flowRepo.updateCurrentStep(client, flowId, nextStep.id);
+
+      return {
+        type: "nextStep",
+        nextStep,
+        schema: nextStep.input_schema || {},
+      };
+    }
+
+    const template = await templateRepo.getTemplateWithSteps(client, flow.template_id);
+    if (!template) throw new Error("Template not found");
+
+    if (template.requires_approval) {
+      await flowRepo.updateStatus(client, flowId, "PENDING_APPROVAL");
+      return {
+        type: "pendingApproval",
+        message: "Waiting for admin approval",
+      };
+    }
+
+    await flowRepo.updateStatus(client, flowId, "COMPLETED");
+    await userRoleRepo.activateRole(client, flow.user_role_id);
+
+    return {
+      type: "completed",
+      message: "Flow completed",
+    };
+  });
+}
+
+async function getStepData(flowId, stepId, userId) {
+  flowId = Number(flowId);
+  stepId = Number(stepId);
+
+  if (isNaN(flowId) || isNaN(stepId)) {
+    throw new Error("Invalid flowId or stepId");
+  }
+
+  return withTransaction(async (client) => {
+    const flow = await flowRepo.getFlow(client, flowId);
+    if (!flow) throw new Error("Flow not found");
+
+    const userRole = await userRoleRepo.getUserRoleById(
+      client,
+      flow.user_role_id
+    );
+
+    if (!userRole || userRole.user_id !== userId) {
+      throw new Error("Forbidden");
+    }
+
+    const stepData = await stepRepo.getStepData(client, flowId, stepId);
+
+    if (!stepData) {
+      return {
+        data: {},
+        status: "NOT_STARTED",
+      };
+    }
+
+    return {
+      data: stepData.data,
+      status: stepData.status,
+    };
+  });
+}
+
+module.exports = {
+  submitStep,
+  getStepData,
+};===== ./modules/auth/auth.controller.js =====
+const service = require('./auth.service');
+const asyncHandler = require('../../utils/asyncHandler');
+const { success } = require('../../utils/apiResponse');
+
+const register = asyncHandler(async (req, res) => {
+  const data = await service.register(req.body);
+  res.status(201).json(success('userRegistered', data));
+});
+
+const login = asyncHandler(async (req, res) => {
+  const data = await service.login(req.body);
+  res.json(success('loginSuccess', data));
+});
+
+module.exports = { register, login };
+===== ./modules/auth/auth.service.js =====
+const { withTransaction } = require('../../config/transaction');
+const userRepo = require('../users/user.repository');
+const userRoleRepo = require('../user_roles/userRole.repository');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcrypt');
+const rolePermissionRepo = require('../roles/rolePermission.repository');
+
+const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret_change_me';
+const SALT_ROUNDS = 10;
+
+async function register(data) {
+  if (!data.email || !data.password || !data.name) throw new Error('Missing fields');
+
+  return withTransaction(async (client) => {
+    const existing = await userRepo.getUserByEmail(client, data.email);
+    if (existing) throw new Error('User already exists');
+
+    const hash = await bcrypt.hash(data.password, SALT_ROUNDS);
+    const user = await userRepo.createUser(client, data.name, data.email, hash);
+
+    const roles = [];
+    const permissions = [];
+    const needsRoleSelection = true;
+
+    const token = jwt.sign({ sub: user.id }, JWT_SECRET, { expiresIn: '7d' });
+
+    return { user, roles, permissions, token, needsRoleSelection };
+  });
+}
+
+async function login(data) {
+  if (!data.email || !data.password) throw new Error('Missing fields');
+
+  return withTransaction(async (client) => {
+    const user = await userRepo.getUserByEmail(client, data.email);
+    if (!user) throw new Error('Invalid credentials');
+
+    const match = await bcrypt.compare(data.password, user.password_hash || user.passwordHash || '');
+    if (!match) throw new Error('Invalid credentials');
+
+    const roles = await userRoleRepo.getUserRoles(client, user.id);
+    const roleIds = roles.map(r => r.id);
+    const permissions = await rolePermissionRepo.getPermissionsForRoles(client, roleIds);
+    const token = jwt.sign({ sub: user.id }, JWT_SECRET, { expiresIn: '7d' });
+
+const needsRoleSelection = roles.length === 0;
+
+return { user, roles, permissions, token, needsRoleSelection };
+  });
+}
+
+module.exports = { register, login };
+===== ./modules/auth/auth.routes.js =====
+const express = require('express');
+const router = express.Router();
+const authController = require('./auth.controller');
+
+router.post('/register', authController.register);
+router.post('/login', authController.login);
+
+module.exports = router;
+===== ./modules/campaigns/campaigns.repository.js =====
+// campaigns.repository.js
+
+const db = require('../../config/db');
+
+async function createCampaign(client, data) {
+  const {
+    title,
+    description,
+    slug,
+    created_by,
+    user_role_id,
+    donation_type,
+    goal_amount,
+    goal_quantity
+  } = data;
+
+  const res = await client.query(
+    `INSERT INTO campaigns (
+      title, description, slug,
+      created_by, user_role_id,
+      donation_type, goal_amount, goal_quantity
+    )
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+    RETURNING *`,
+    [
+      title,
+      description,
+      slug,
+      created_by,
+      user_role_id,
+      donation_type,
+      goal_amount,
+      goal_quantity
+    ]
+  );
+
+  return res.rows[0];
+}
+
+async function getCampaignById(client, id) {
+  const res = await client.query(
+    `SELECT * FROM campaigns WHERE id=$1 AND deleted_at IS NULL`,
+    [id]
+  );
+
+  return res.rows[0];
+}
+
+async function updateStatus(client, id, status) {
+  const res = await client.query(
+    `UPDATE campaigns
+     SET status=$1, updated_at=now()
+     WHERE id=$2
+     RETURNING *`,
+    [status, id]
+  );
+
+  return res.rows[0];
+}
+
+module.exports = {
+  createCampaign,
+  getCampaignById,
+  updateStatus
+};
+
+===== ./modules/campaigns/campaigns.controller.js =====
+const service = require('./campaigns.service');
+const asyncHandler = require('../../utils/asyncHandler');
+const { success } = require('../../utils/apiResponse');
+
+const createCampaign = asyncHandler(async (req, res) => {
+  const result = await service.createCampaign(req.body, req.user);
+  res.status(201).json(success('campaignCreated', result));
+});
+
+const activateCampaign = asyncHandler(async (req, res) => {
+  const result = await service.activateCampaign(req.params.id);
+  res.json(success('campaignActivated', result));
+});
+
+module.exports = {
+  createCampaign,
+  activateCampaign
+};
+
+===== ./modules/campaigns/campaigns.routes.js =====
+const express = require('express');
+const router = express.Router();
+
+const controller = require('./campaigns.controller');
+const { authenticate } = require('../../utils/authMiddleware');
+const { requirePermission } = require('../../utils/permissionMiddleware');
+
+router.post(
+  '/',
+  authenticate,
+  requirePermission('campaign:create'),
+  controller.createCampaign
+);
+
+router.patch(
+  '/:id/activate',
+  authenticate,
+  requirePermission('campaign:activate'),
+  controller.activateCampaign
+);
+
+module.exports = router;===== ./modules/campaigns/campaigns.service.js =====
+const { withTransaction } = require('../../config/transaction');
+const repo = require('./campaigns.repository');
+
+async function createCampaign(data, user) {
+
+  return withTransaction(async (client) => {
+
+    const activeRole = user.roles?.find(r => r.is_active);
+
+    if (!activeRole) {
+      throw new Error('Complete onboarding first');
+    }
+
+    return await repo.createCampaign(client, {
+      ...data,
+      created_by: user.id,
+      user_role_id: activeRole.user_role_id
+    });
+  });
+}
+
+async function activateCampaign(id) {
+  return withTransaction(async (client) => {
+
+    const campaign = await repo.getCampaignById(client, id);
+
+    if (!campaign) throw new Error('Campaign not found');
+
+    if (campaign.status !== 'DRAFT') {
+      throw new Error('Only DRAFT campaigns can be activated');
+    }
+
+    return repo.updateStatus(client, id, 'ACTIVE');
+  });
+}
+
+module.exports = {
+  createCampaign,
+  activateCampaign
+};
+
+===== ./modules/session/session.controller.js =====
+const asyncHandler = require("../../utils/asyncHandler");
+const { success } = require("../../utils/apiResponse");
+const service = require("./session.service");
+const { withTransaction } = require("../../config/transaction");
+
+// GET /session
+const getSession = asyncHandler(async (req, res) => {
+
+  const userId = req.user.id;
+
+  const session = await withTransaction(async (client) => {
+    return await service.buildSession(client, userId);
+  });
+
+  res.json(success("sessionFetched", session));
+});
+
+module.exports = {
+  getSession
+};===== ./modules/session/session.service.js =====
+const userRepo = require("../users/user.repository");
+const userRoleRepo = require("../user_roles/userRole.repository");
+const rolePermissionRepo = require("../roles/rolePermission.repository");
+const onboardingRepo = require("../onboarding/onboarding.repository");
+
+async function buildSession(client, userId) {
+
+  // 1. Get user
+  const user = await userRepo.getUserById(client, userId);
+  if (!user) throw new Error("User not found");
+
+  // 2. Get roles
+  const roles = await userRoleRepo.getUserRoles(client, userId);
+
+  // 3. Active role
+  const activeRole = roles.find(r => r.is_active) || null;
+
+  const roleIds = roles.map(r => r.id);
+
+  // 4. Permissions
+  const permissions =
+    roleIds.length > 0
+      ? await rolePermissionRepo.getPermissionsForRoles(client, roleIds)
+      : [];
+
+  // 5. Onboarding state (ONLY if active role exists)
+  let onboardingState = null;
+
+  if (activeRole) {
+    onboardingState = await onboardingRepo.getUserOnboardingState(
+      client,
+      activeRole.user_role_id
+    );
+  }
+
+  const isOnboardingComplete = !!activeRole?.is_active;
+
+  // 6. Access rules (centralized logic)
+  const access = {
+    canCreateCampaign: isOnboardingComplete,
+    canAccessDashboard: isOnboardingComplete
+  };
+
+  // 7. Final session object
+  return {
+    user,
+    roles,
+    activeRole,
+    permissions,
+
+    onboarding: {
+      isCompleted: isOnboardingComplete,
+      flowId: onboardingState?.flow_id || null,
+      currentStep: onboardingState?.current_step || null,
+      needsRoleSelection: roles.length === 0
+    },
+
+    access
+  };
+}
+
+module.exports = {
+  buildSession
+};===== ./modules/session/session.routes.js =====
+const express = require("express");
+const router = express.Router();
+
+const controller = require("./session.controller");
+const { authenticate } = require("../../middlewares/auth");
+
+// 🔐 Single source of truth endpoint
+router.get("/", authenticate, controller.getSession);
+
+module.exports = router;===== ./middlewares/auth.js =====
+// middleware/auth.js
+const jwt = require("jsonwebtoken");
+
+module.exports = (req, res, next) => {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader) throw new Error("No token provided");
+
+  const token = authHeader.split(" ")[1];
+  const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+  req.user = { id: decoded.sub };
+
+  next();
+};===== ./app.js =====
+const express = require("express");
+const app = express();
+const logger = require("./utils/logger");
+
+const {fail} = require('./utils/apiResponse')
+// Middleware
+app.use(express.json());
+app.use(logger)
+// Routes
+const userRoutes = require("./modules/users/user.routes");
+const authRoutes = require('./modules/auth/auth.routes');
+const roleRoutes = require('./modules/roles/role.routes')
+const onboardingRoutes = require("./modules/onboarding/onboarding.routes");
+const flowRoutes = require("./modules/onboarding/onboarding_flow.routes");
+const executionRoutes = require("./modules/onboarding/onboarding_execution.routes");
+const campaignRoutes = require("./modules/campaigns/campaigns.routes");
+const sessionRoutes = require("./modules/session/session.routes");
+const stepsRoutes = require("./modules/steps/steps.routes");
+
+
+
+app.use("/users", userRoutes);
+app.use('/auth', authRoutes);
+app.use("/roles" , roleRoutes)
+app.use("/onboarding", onboardingRoutes);
+app.use("/onboarding", executionRoutes);
+app.use("/onboarding-flow", flowRoutes);
+app.use("/flows", flowRoutes);
+app.use("/flows", executionRoutes);
+app.use("/onboarding-execution", executionRoutes);
+app.use("/steps", stepsRoutes);
+app.use("/campaigns", campaignRoutes);
+
+app.use("/session", sessionRoutes);
+
+// Health check (IMPORTANT for Step 1 testing)
+app.get("/health", (req, res) => {
+  res.json({
+    status: "ok",
+    service: "backend-running"
+  });
+});
+
+// Error Handler
+app.use((err, req, res, next) => {
+    console.error(err);
+
+    // validation error special handling
+    if (err.message === "Validation failed") {
+        return res.status(400).json(
+            fail("validationFailed", {
+                message: err.message,
+                details: err.details || {}
+            })
+        );
+    }
+
+    res.status(500).json(
+        fail("internalError", {
+            message: err.message || "Internal Server Error"
+        })
+    );
+});
+module.exports = app;
+===== ./server.js =====
+require("dotenv").config();
+
+const app = require("./app");
+
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});

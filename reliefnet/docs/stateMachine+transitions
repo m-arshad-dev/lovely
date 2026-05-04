@@ -1,0 +1,356 @@
+Good — this is the point where your schema becomes a real **workflow engine design**, not just tables.
+
+I’ll map this as a **state machine + allowed transitions + event flow**, so you can implement it cleanly in code without guessing.
+
+---
+
+# 🧠 1. CORE IDEA: YOU ARE BUILDING A STATE MACHINE
+
+You actually have **3 separate state machines**:
+
+---
+
+## 🟦 (A) Onboarding Flow State Machine
+
+```text id="sm1"
+onboarding_flows.status
+```
+
+### States:
+
+```text id="sm2"
+IN_PROGRESS
+COMPLETED
+FAILED
+```
+
+---
+
+## 🟨 (B) Step State Machine
+
+```text id="sm3"
+onboarding_step_data.status
+```
+
+### States:
+
+```text id="sm4"
+NOT_STARTED
+IN_PROGRESS
+SUBMITTED
+APPROVED
+REJECTED
+```
+
+---
+
+## 🟥 (C) Approval State Machine
+
+```text id="sm5"
+approvals.status
+```
+
+### States:
+
+```text id="sm6"
+PENDING
+APPROVED
+REJECTED
+```
+
+---
+
+# 🔁 2. ALLOWED TRANSITIONS (MOST IMPORTANT PART)
+
+This is the “rules engine” of your system.
+
+---
+
+# 🟦 A) ONBOARDING FLOW TRANSITIONS
+
+```text id="f1"
+IN_PROGRESS → COMPLETED
+IN_PROGRESS → FAILED
+```
+
+### ❌ NOT allowed:
+
+```text id="f2"
+COMPLETED → IN_PROGRESS
+COMPLETED → FAILED
+FAILED → COMPLETED (unless manual reset logic exists)
+```
+
+---
+
+### 🧠 Meaning:
+
+| Transition              | Meaning                          |
+| ----------------------- | -------------------------------- |
+| IN_PROGRESS → COMPLETED | onboarding finished successfully |
+| IN_PROGRESS → FAILED    | onboarding aborted               |
+
+---
+
+# 🟨 B) STEP DATA TRANSITIONS
+
+```text id="f3"
+NOT_STARTED → IN_PROGRESS
+IN_PROGRESS → SUBMITTED
+SUBMITTED → APPROVED
+SUBMITTED → REJECTED
+REJECTED → IN_PROGRESS (optional retry)
+```
+
+---
+
+### 🧠 Meaning:
+
+| State       | Meaning                  |
+| ----------- | ------------------------ |
+| NOT_STARTED | user hasn't touched step |
+| IN_PROGRESS | user filling form        |
+| SUBMITTED   | user submitted data      |
+| APPROVED    | admin/system approved    |
+| REJECTED    | failed validation        |
+
+---
+
+# 🟥 C) APPROVAL TRANSITIONS
+
+```text id="f4"
+PENDING → APPROVED
+PENDING → REJECTED
+```
+
+### ❌ NOT allowed:
+
+```text id="f5"
+APPROVED → REJECTED
+REJECTED → APPROVED
+```
+
+(kept immutable for audit integrity)
+
+---
+
+# 🔄 3. FULL SYSTEM FLOW (REAL LIFE EXECUTION)
+
+This is how everything connects:
+
+---
+
+## 🟢 STEP 1: Role assignment
+
+```text id="s1"
+user_roles.is_active = FALSE
+```
+
+---
+
+## 🟢 STEP 2: Onboarding starts
+
+```text id="s2"
+onboarding_flows created
+status = IN_PROGRESS
+```
+
+---
+
+## 🟢 STEP 3: Step execution loop
+
+For each step:
+
+```text id="s3"
+NOT_STARTED
+  ↓
+IN_PROGRESS
+  ↓
+SUBMITTED
+```
+
+Then either:
+
+* APPROVED → move to next step
+* REJECTED → retry same step
+
+---
+
+## 🟢 STEP 4: Flow completion
+
+```text id="s4"
+all steps APPROVED
+→ onboarding_flows = COMPLETED
+```
+
+---
+
+## 🟢 STEP 5: Decision point
+
+### CASE A — no approval required
+
+```text id="s5"
+user_roles.is_active = TRUE
+activated_by = NULL (system)
+```
+
+---
+
+### CASE B — approval required
+
+```text id="s6"
+approvals created
+PENDING → APPROVED
+```
+
+Then:
+
+```text id="s7"
+user_roles.is_active = TRUE
+activated_by = admin_id
+```
+
+---
+
+# ⚙️ 4. STATE MACHINE RULE ENGINE (HOW YOU ENFORCE IT)
+
+You now enforce rules in **3 layers**:
+
+---
+
+## 🟦 Layer 1 — Database (hard safety)
+
+* FK constraints (steps, flows)
+* unique indexes
+* triggers (basic validation)
+
+---
+
+## 🟨 Layer 2 — Service Layer (main logic)
+
+This handles:
+
+```text id="l1"
+allowed transitions
+approval decisions
+role activation
+step progression
+```
+
+---
+
+## 🟥 Layer 3 — Event Layer (optional but powerful)
+
+Events like:
+
+```text id="l2"
+on_step_submitted
+on_flow_completed
+on_approval_approved
+```
+
+---
+
+# 🧠 5. CRITICAL DESIGN INSIGHT (THIS IS THE KEY)
+
+You should think in terms of:
+
+## ❌ NOT:
+
+> “update tables”
+
+## ✅ INSTEAD:
+
+> “transition states”
+
+---
+
+# 🧩 6. VISUAL FLOW (MENTAL MODEL)
+
+```text id="v1"
+USER
+  ↓
+USER_ROLE (inactive)
+  ↓
+ONBOARDING_FLOW (IN_PROGRESS)
+  ↓
+STEP 1 → STEP 2 → STEP 3
+  ↓
+FLOW COMPLETED
+  ↓
+APPROVAL (optional)
+  ↓
+USER_ROLE ACTIVE
+```
+
+---
+
+# ⚠️ 7. WHERE PEOPLE USUALLY FAIL (IMPORTANT)
+
+If you don’t define this clearly, you will get bugs like:
+
+### ❌ invalid transitions:
+
+* skipping steps
+* double approvals
+* re-activating roles
+* inconsistent flow states
+
+---
+
+# 🔥 8. FINAL “RULE SET” SUMMARY
+
+## ONBOARDING FLOW
+
+```text
+IN_PROGRESS → COMPLETED | FAILED
+```
+
+## STEP DATA
+
+```text
+NOT_STARTED → IN_PROGRESS → SUBMITTED → APPROVED | REJECTED
+```
+
+## APPROVALS
+
+```text
+PENDING → APPROVED | REJECTED
+```
+
+## ROLE ACTIVATION RULE
+
+```text
+IF flow COMPLETED AND no approval needed → activate role
+IF approval APPROVED → activate role
+```
+
+---
+
+# 🚀 9. WHAT YOU NOW HAVE
+
+You’ve essentially designed:
+
+> 🧠 A **multi-layer state machine workflow engine**
+
+This is the same structure used in:
+
+* Stripe onboarding flows
+* Notion workspace invites
+* SaaS KYC systems
+* HR onboarding systems
+
+---
+
+# If you want next step (very valuable)
+
+I can help you design:
+
+### 👉 clean backend architecture for this
+
+* service functions (createFlow, submitStep, approveFlow)
+* idempotency rules (VERY important)
+* race condition handling
+* event-driven version (Kafka / queue style)
+
+That’s where this becomes **production-grade scalable system design**.

@@ -1,0 +1,22 @@
+curl -X POST http://localhost:3000/users \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Arshad",
+    "email": "arshad@example.com",
+    "password": "123456"
+  }'
+
+curl http://localhost:3000/users/1
+
+curl -X POST http://localhost:3000/users/assign-role \
+  -H "Content-Type: application/json" \
+  -d '{
+    "userId": 1,
+    "roleId": 2
+  }'
+
+
+curl http://localhost:3000/roles
+
+
+curl http://localhost:3000/roles/1
