@@ -17,7 +17,7 @@ const executionRoutes = require("./modules/onboarding/onboarding_execution.route
 const campaignRoutes = require("./modules/campaigns/campaigns.routes");
 const sessionRoutes = require("./modules/session/session.routes");
 const stepsRoutes = require("./modules/steps/steps.routes");
-
+const beneficiaryRequestRoutes = require('./modules/beneficiary_requests/beneficiaryRequests.routes');
 
 
 app.use("/users", userRoutes);
@@ -31,6 +31,7 @@ app.use("/flows", executionRoutes);
 app.use("/onboarding-execution", executionRoutes);
 app.use("/steps", stepsRoutes);
 app.use("/campaigns", campaignRoutes);
+app.use('/beneficiary-requests', beneficiaryRequestRoutes);
 
 app.use("/session", sessionRoutes);
 
